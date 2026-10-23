@@ -1,0 +1,62 @@
+pipeline {
+  agent any
+  parameters {
+    choice(name: 'ACTION', choices: ['plan', 'apply', 'destroy'], description: 'Reviewed action')
+    string(name: 'ENVIRONMENT_ID', description: 'Lowercase environment UUID')
+    string(name: 'EXPIRES_AT', description: 'UTC expiry timestamp')
+  }
+  options { disableConcurrentBuilds(); timeout(time: 30, unit: 'MINUTES') }
+  stages {
+    stage('Validate contract') {
+      steps {
+        script {
+          if (!(params.ENVIRONMENT_ID ==~ /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)) {
+            error('Invalid environment ID')
+          }
+          if (!(params.EXPIRES_AT ==~ /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/)) {
+            error('Invalid expiry timestamp')
+          }
+        }
+      }
+    }
+    stage('Terraform init and validate') {
+      steps {
+        dir('infra/templates/ec2_sandbox') {
+          sh '''set -eu
+            terraform fmt -check
+            terraform init -input=false -backend-config="bucket=$ENVPILOT_STATE_BUCKET" -backend-config="region=ap-southeast-2" -backend-config="key=envpilot/environments/$ENVIRONMENT_ID/terraform.tfstate" -backend-config="encrypt=true" -backend-config="use_lockfile=true"
+            terraform validate
+          '''
+        }
+      }
+    }
+    stage('Plan') {
+      steps {
+        dir('infra/templates/ec2_sandbox') {
+          sh '''set -eu
+            if [ "$ACTION" = destroy ]; then
+              terraform plan -destroy -input=false -out=envpilot.tfplan -var="environment_id=$ENVIRONMENT_ID" -var="expires_at=$EXPIRES_AT" -var="vpc_id=$ENVPILOT_VPC_ID" -var="subnet_id=$ENVPILOT_SUBNET_ID"
+            else
+              terraform plan -input=false -out=envpilot.tfplan -var="environment_id=$ENVIRONMENT_ID" -var="expires_at=$EXPIRES_AT" -var="vpc_id=$ENVPILOT_VPC_ID" -var="subnet_id=$ENVPILOT_SUBNET_ID"
+            fi
+          '''
+        }
+      }
+    }
+    stage('Apply reviewed plan') {
+      when { expression { params.ACTION != 'plan' } }
+      steps {
+        script {
+          if (env.ENVPILOT_ENABLE_AWS != 'true') { error('Real AWS actions are disabled') }
+        }
+        dir('infra/templates/ec2_sandbox') { sh 'terraform apply -input=false -auto-approve envpilot.tfplan' }
+      }
+    }
+  }
+  environment {
+    ENVIRONMENT_ID = "${params.ENVIRONMENT_ID}"
+    EXPIRES_AT = "${params.EXPIRES_AT}"
+    ACTION = "${params.ACTION}"
+  }
+  post { always { deleteDir() } }
+}
